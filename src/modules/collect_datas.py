@@ -4,7 +4,9 @@ import subprocess
 import git
 import traceback
 import json
+import logging
 from typing import Optional, Tuple
+
 
 def _find_repo_root(start: Path) -> Path:
     for parent in [start] + list(start.parents):
@@ -17,13 +19,22 @@ project_root = _find_repo_root(Path(__file__).resolve())
 sys.path.append(str(project_root))
 sys.path.append(str(project_root / "src"))
 from modules.github_linguist import get_exts
+from modules.source_filter import apply_filter
 from config import (
     ANTLR_LANGUAGE,
     CCFINDERSW_JAR,
     CCFINDERSWPARSER,
     CCFINDERSW_JAVA_XMX,
     CCFINDERSW_JAVA_XSS,
+    APPLY_IMPORT_FILTER,
 )
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 def parse_diff_str(diff: str) -> Optional[Tuple[list[str], int, int]]:
@@ -56,8 +67,8 @@ def find_moving_lines(commit: git.Commit, prev: git.Commit, name: str):
                 if result is None:
                     continue
             except UnicodeDecodeError:
-                print(f"diff.diff.decode('utf-8')のデコードに失敗しました．")
-                print(diff_hunk.diff)
+                logger.warning("diff.diff.decode('utf-8')のデコードに失敗しました．")
+                logger.warning(str(diff_hunk.diff))
                 continue
             hunk, old_file_line_count, new_file_line_count = result
             potential_inserted_lines: list[int] = []
@@ -110,7 +121,15 @@ def convert_language_for_ccfindersw(language: str) -> str:
             return language.lower()
 
 
-def detect_cc(project: Path, name: str, language: str, commit_hash: str, exts: tuple[str]):
+def detect_cc(
+    project: Path,
+    name: str,
+    language: str,
+    commit_hash: str,
+    exts: tuple[str],
+    min_tokens: int = 50,
+    log=None,
+):
     """対象言語とコミットで CC-Finder SW を実行し、結果を保存する。"""
     try:
         dest_dir = project_root / "dest/temp/ccfswtxt" / name / commit_hash
@@ -131,31 +150,68 @@ def detect_cc(project: Path, name: str, language: str, commit_hash: str, exts: t
             "-o",
             str(dest_file),
         ]
+        token_str = str(min_tokens)
         if language in ANTLR_LANGUAGE:
-            cmd = [*base_cmd, "-antlr", "|".join(exts), "-w", "2", "-ccfsw", "set"]
+            cmd = [
+                *base_cmd,
+                "-antlr",
+                "|".join(exts),
+                "-w",
+                "2",
+                "-t",
+                token_str,
+                "-ccfsw",
+                "set",
+            ]
         else:
-            cmd = [*base_cmd, "-w", "2", "-ccfsw", "set"]
-        subprocess.run(cmd, check=True)
-        
+            cmd = [*base_cmd, "-w", "2", "-t", token_str, "-ccfsw", "set"]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if log is not None:
+            if result.stdout:
+                log.write(result.stdout)
+            if result.stderr:
+                log.write(result.stderr)
+
         json_dest_dir = project_root / "dest/clones_json" / name / commit_hash
         json_dest_dir.mkdir(parents=True, exist_ok=True)
         json_dest_file = json_dest_dir / f"{language}.json"
-        cmd = [str(CCFINDERSWPARSER), "-i", str(f"{dest_file}_ccfsw.txt"), "-o", str(json_dest_file)]
-        subprocess.run(cmd, check=True)
+        cmd = [
+            str(CCFINDERSWPARSER),
+            "-i",
+            str(f"{dest_file}_ccfsw.txt"),
+            "-o",
+            str(json_dest_file),
+        ]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if log is not None:
+            if result.stdout:
+                log.write(result.stdout)
+            if result.stderr:
+                log.write(result.stderr)
     except Exception as e:
-        print("CCFinderの実行に失敗しました．")
-        print(traceback.format_exc())
-        raise e
+        if log is not None and hasattr(e, "stdout") and e.stdout:
+            log.write(e.stdout)
+        if log is not None and hasattr(e, "stderr") and e.stderr:
+            log.write(e.stderr)
+        logger.exception("CCFinderの実行に失敗しました．")
+        raise RuntimeError(
+            f"CCFinderSW failed for {name} {commit_hash} {language}"
+        ) from e
 
 
-def collect_datas_of_repo(project: dict):
+def collect_datas_of_repo(
+    project: dict,
+    apply_import_filter: bool = APPLY_IMPORT_FILTER,
+    min_tokens: int = 50,
+    log=None,
+) -> None:
     """対象コミットに対してコードクローンと変更行情報を収集する。"""
     url = project["URL"]
     # リポジトリの識別子とプロジェクトディレクトリの設定
-    name = url.split('/')[-2] + '.' + url.split('/')[-1]
-    print("--------------------------------")
-    print(name)
-    print("--------------------------------")
+    name = url.split("/")[-2] + "." + url.split("/")[-1]
+    logger.info("--------------------------------")
+    logger.info(name)
+    logger.info("--------------------------------")
     project_dir = project_root / "dest/projects" / name
     analyzed_commits_path = project_root / "dest/analyzed_commits" / f"{name}.json"
 
@@ -172,27 +228,53 @@ def collect_datas_of_repo(project: dict):
         for commit_hash in analyzed_commit_hashes:
             missing_languages = []
             for language in languages:
-                clones_json = project_root / "dest/clones_json" / name / commit_hash / f"{language}.json"
+                clones_json = (
+                    project_root
+                    / "dest/clones_json"
+                    / name
+                    / commit_hash
+                    / f"{language}.json"
+                )
                 if not clones_json.exists():
                     missing_languages.append(language)
             if missing_languages:
-                print(f"checkout to {commit_hash}...")
-                git_repo.git.checkout(commit_hash)
+                logger.info("checkout to %s...", commit_hash)
+                git_repo.git.checkout("-f", commit_hash)
+
+                if apply_import_filter:
+                    # import行フィルタの適用
+                    apply_filter(project_dir, languages, exts)
+
                 for language in missing_languages:
-                    detect_cc(project_dir, name, language, commit_hash, exts[language])
+                    detect_cc(
+                        project_dir,
+                        name,
+                        language,
+                        commit_hash,
+                        exts[language],
+                        min_tokens=min_tokens,
+                        log=log,
+                    )
             else:
-                print(f"skip clone detection for {commit_hash} (already detected)")
+                logger.info(
+                    "skip clone detection for %s (already detected)", commit_hash
+                )
             if commit_hash == hcommit.hexsha:
                 continue
             commit = git_repo.commit(commit_hash)
-            moving_lines_file = project_root / "dest/moving_lines" / name / f"{commit.hexsha}-{prev_commit.hexsha}.json"
+            moving_lines_file = (
+                project_root
+                / "dest/moving_lines"
+                / name
+                / f"{commit.hexsha}-{prev_commit.hexsha}.json"
+            )
             if not moving_lines_file.exists():
                 # 修正を保存
                 find_moving_lines(commit, prev_commit, name)
             prev_commit = commit
     except Exception as e:
-        print(traceback.format_exc())
-        print(e)
+        logger.exception("collect_datas_of_repo failed for %s", name)
+        raise RuntimeError(f"collect_datas_of_repo failed for {name}") from e
     finally:
-        print("checkout to latest commit...")
-        git_repo.git.checkout(hcommit.hexsha)
+        logger.info("checkout to latest commit...")
+        git_repo.git.checkout("-f", hcommit.hexsha)
